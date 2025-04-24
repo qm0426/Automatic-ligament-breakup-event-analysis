@@ -1,0 +1,6 @@
+numpy==1.26.4
+scikit-learn==1.5.2
+scipy==1.14.1
+ultralystics==8.3.37
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84

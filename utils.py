@@ -1,0 +1,402 @@
+import numpy as np
+import cv2
+from sklearn.cluster import KMeans
+from scipy.spatial import distance_matrix
+from scipy.optimize import linear_sum_assignment
+
+
+def mask_treatment(mask):
+    '''
+    handle the mask with .jpg format, cv2.imread function will wrongly turn the binary mask into other values, if the mask is not end with .jpg, no need to
+    call the function
+    '''
+    mask[mask <= 127] = 0
+    mask[mask > 127] = 255
+    mask = mask.astype(np.uint8)
+    return mask
+
+
+def deal_with_single_frame(txtpath, W, H):
+    """
+    read the txt file from yolo detection, get the boxes, process the boxes with the iou matrix and the contrast of vertical positions.
+
+    """
+
+    def iou(boxes0, boxes1):
+        A = boxes0.shape[0]
+        B = boxes1.shape[0]
+
+        xy_max = np.minimum(
+            boxes0[:, np.newaxis, 2:].repeat(B, axis=1),
+            np.broadcast_to(boxes1[:, 2:], (A, B, 2)),
+        )
+        xy_min = np.maximum(
+            boxes0[:, np.newaxis, :2].repeat(B, axis=1),
+            np.broadcast_to(boxes1[:, :2], (A, B, 2)),
+        )
+
+        inter = np.clip(xy_max - xy_min, a_min=0, a_max=np.inf)
+        inter = inter[:, :, 0] * inter[:, :, 1]
+
+        area_0 = ((boxes0[:, 2] - boxes0[:, 0]) * (boxes0[:, 3] - boxes0[:, 1]))[
+            :, np.newaxis
+        ].repeat(B, axis=1)
+        area_1 = ((boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1]))[
+            np.newaxis, :
+        ].repeat(A, axis=0)
+
+        return inter / (area_0 + area_1 - inter)
+
+    with open(txtpath) as f:
+        lines = f.readlines()
+    boxes = []
+    ys = []
+    processed_boxes = []
+    for line in lines:
+        line = line.strip().split(" ")
+        x, y, w, h = (
+            float(line[1]) * W,
+            float(line[2]) * H,
+            float(line[3]) * W,
+            float(line[4]) * H,
+        )
+        x1, y1, x2, y2 = x - w / 2, y - h / 2, x + w / 2, y + h / 2
+        boxes.append([x1, y1, x2, y2])
+        ys.append(y)
+
+    # if len(boxes) == 2:
+    if len(boxes) > 1:
+        ioumatrix = np.triu(iou(np.array(boxes), np.array(boxes)), k=1)
+        if np.max(ioumatrix) == 0:
+            ys_sorted = sorted(ys)
+            y_contrast = [
+                ys_sorted[i + 1] - ys_sorted[i] for i in range(len(ys_sorted) - 1)
+            ]
+            if min(y_contrast) < 30:
+                minid = y_contrast.index(min(y_contrast))
+                candi_y1, candi_y2 = ys_sorted[minid], ys_sorted[minid + 1]
+                tru_y1, tru_y2 = ys[ys.index(candi_y1)], ys[ys.index(candi_y2)]
+                trubox1 = boxes[ys.index(candi_y1)]
+                trubox2 = boxes[ys.index(candi_y2)]
+                new_box = [
+                    min(trubox1[0], trubox2[0]),
+                    min(trubox1[1], trubox2[1]),
+                    max(trubox1[2], trubox2[2]),
+                    max(trubox1[3], trubox2[3]),
+                ]
+                processed_boxes.append(new_box)
+                for i, box in enumerate(boxes):
+                    if box != trubox1 and box != trubox2:
+                        processed_boxes.append(box)
+            else:
+                processed_boxes = boxes
+
+        else:
+            boxes = np.array(boxes)
+            ioumatrix += np.tri(ioumatrix.shape[0])
+            independ_box = []
+            for i in range(ioumatrix.shape[0]):
+                if 0 not in ioumatrix[i, :]:
+                    break
+                else:
+                    independ_box.append(boxes[i])
+            if len(independ_box) == 0:
+                processed_boxes = [
+                    [
+                        min(boxes[:, 0]),
+                        min(boxes[:, 1]),
+                        max(boxes[:, 2]),
+                        max(boxes[:, 3]),
+                    ]
+                ]
+            else:
+                for h in independ_box:
+                    processed_boxes.append(h)
+                    boxes = boxes.tolist()
+                    t_id = boxes.index(h.tolist())
+                    del boxes[t_id]
+                    boxes = np.array(boxes)
+                processed_boxes = [
+                    [
+                        min(boxes[:, 0]),
+                        min(boxes[:, 1]),
+                        max(boxes[:, 2]),
+                        max(boxes[:, 3]),
+                    ]
+                ]
+    else:
+        processed_boxes = boxes
+
+    return processed_boxes
+
+
+def pro_propress_mask(mask):
+    '''
+    remove the small connected components.
+    '''
+    mask = mask.astype(np.uint8)
+
+    retval, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+
+    all_area = np.sum(mask) / 255
+
+    new_mask = np.zeros_like(mask)
+    for i in range(1, retval):
+
+        if stats[i, cv2.CC_STAT_AREA] / all_area <= 5e-3:
+            new_mask[labels == (i)] = 0
+        else:
+            new_mask[labels == (i)] = 255
+    return new_mask
+
+
+def post_process_via_cluster(img, out_mask):
+    '''
+    post process the mask generated by sam2 model, the mask is a binary mask, we need to remove the small connected components and fill the holes.
+    '''
+
+    img[out_mask == 0] = 255
+    # plt.imshow(mask)
+    # plt.show()
+    posi_coors = np.where(img < 255)
+    posi_value = img[posi_coors]
+    # plt.hist(posi_value, color="orange", rwidth=0.8)
+    # plt.show()
+    kmeans = KMeans(n_clusters=2)
+    kmeans.fit(posi_value.reshape(-1, 1))
+    labels = kmeans.labels_
+    cl1_value = posi_value[labels == 0]
+    cl2_value = posi_value[labels == 1]
+    judge_list = [
+        np.max(cl1_value),
+        np.max(cl2_value),
+        np.min(cl1_value),
+        np.min(cl2_value),
+    ]
+    judge_list = sorted(judge_list)
+    thre = int(0.5 * (judge_list[1] + judge_list[2]))
+    # print(thre)
+    new_mask = np.zeros_like(img)
+
+    img[img < thre] = 0
+    img[img >= thre] = 255
+
+    img = 255 - img
+    mask = pro_propress_mask(img[..., 0])
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
+    return mask
+
+
+def get_partitions(arr, N):
+    '''
+    Get the combinations of arr into N groups, which do not disrupt the original order of arr.
+    '''
+    result = []
+
+    def backtrack(start, current_partition):
+
+        if len(current_partition) == N:
+            if start == len(arr):
+                result.append([list(group) for group in current_partition])
+            return
+        for i in range(start + 1, len(arr) + 1):
+            current_partition.append(arr[start:i])
+            backtrack(i, current_partition)
+            current_partition.pop()
+
+    backtrack(0, [])
+    return result
+
+
+def warp_image(img, flow):
+    """
+    Warp an image using the given light flow field.
+    """
+    h, w = flow.shape[:2]
+    # 生成坐标网格
+    flow_map = np.zeros_like(flow)
+    flow_map[..., 0] = np.arange(w)
+    flow_map[..., 1] = np.arange(h)[:, np.newaxis]
+
+    # 添加光流
+    remap = flow_map + flow
+
+    # 分离坐标
+    remap_x = remap[..., 0].astype(np.float32)
+    remap_y = remap[..., 1].astype(np.float32)
+
+    # 使用双线性插值进行重映射
+    warped_img = cv2.remap(
+        img,
+        remap_x,
+        remap_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return warped_img
+
+
+def cal_light_flow(img1, img2):
+    '''
+    calculate the light flow between two images
+    '''
+    inst = cv2.optflow.createOptFlow_DeepFlow()
+
+    flow = inst.calc(img1, img2, None)
+    flow = np.array(flow, dtype=np.float32)
+    pred = warp_image(img1, -1 * flow)
+
+    img1 = pred
+
+    return flow
+
+
+def single_match(candidates, area_thre, dis_thre, pairs, raw_candidates):
+    '''
+    obtain the matching relationship between candidates and targets
+    pairs: the already dict of the matching relationship e.g. pairs={'0':[[frame_id, label_id, area, x, y], [frame_id, label_id, area, x, y]]}, '1':[[frame_id, label_id, area, x, y]], ...}, the label id denote the order in the function cv2.connectedComponentsWithStats
+    candidates: the candidate connected areas in the current frame
+    targets: the last connected areas in each value of the pairs
+    '''
+    targets = []
+
+    for pair in pairs.keys():
+        targets.append(pairs[pair][-1])
+
+    targets = np.array(targets)
+    candidates_xy = candidates[:, -2:]
+    candidates_area = candidates[:, 2]
+    targets_xy = targets[:, -2:]
+    targets_area = targets[:, 2]
+    dis_matrix = distance_matrix(candidates_xy, targets_xy)
+    row_ind, col_ind = linear_sum_assignment(dis_matrix)
+    temp_pairs = {}
+    ini_add = 0
+    for row, col in zip(row_ind, col_ind):
+        if (
+            abs(candidates_area[row] - targets_area[col])
+            / (max(candidates_area[row], targets_area[col]))
+            < area_thre
+            and dis_matrix[row, col] < dis_thre
+        ):
+            pairs[str(col)].append(raw_candidates[row])
+        else:
+
+            temp_pairs[str(len(pairs.keys()) + ini_add)] = [raw_candidates[row]]
+            ini_add += 1
+    pairs.update(temp_pairs)
+
+    return pairs
+
+
+def match(flow, pairs, candidate, dis_thre, area_thre):
+    '''
+    call the matching function with the candidates optimized by the light flow field
+    '''
+    update_candidates = []
+    for i in candidate:
+        id, labelid, area, x, y = i
+        dx, dy = flow[y, x, 0], flow[y, x, 1]
+        update_candidates.append([id, labelid, area, x - dx, y - dy])
+    update_candidates = np.array(update_candidates)
+    pairs = single_match(update_candidates, area_thre, dis_thre, pairs, candidate)
+
+
+def cal_match_process(data, raw_all_clusters, cluster_num):
+    '''
+    the matching function of parent and child ligaments between two frames. in each combination, if more than one connected area is paired with
+    certain connected area in the previous frames, these connected areas are merged to one new connected area (averaged X, averaged Y and sum of area)
+    '''
+    data = np.array(data)
+    all_clusters = []
+    for c in raw_all_clusters:
+        if [] not in c:
+            all_clusters.append(c)
+    dislist = []
+    all_process_cluster = []
+    for cluster in all_clusters:
+        if [] not in cluster:
+            temp_process_cluster = []
+            for i in range(cluster_num):
+                temp_cluster = cluster[i]
+                if len(temp_cluster) == 1:
+                    temp_process_cluster.append(temp_cluster[0][1:])
+                else:
+                    process_area = sum([j[1] for j in temp_cluster])
+                    process_x = sum([j[2] for j in temp_cluster]) / len(temp_cluster)
+                    process_y = sum([j[3] for j in temp_cluster]) / len(temp_cluster)
+
+                    temp_process_cluster.append([process_area, process_x, process_y])
+            all_process_cluster.append(temp_process_cluster)
+        dislist = []
+    for process_cluster in all_process_cluster:
+        process_cluster = np.array(process_cluster)
+        dis = np.sum(np.linalg.norm((process_cluster - data[..., 1:]), axis=-1))
+        dislist.append(dis)
+    min_dis = min(dislist)
+    # print(min_dis)
+    min_id = dislist.index(min_dis)
+    return data, all_clusters[min_id], min_id
+
+
+def new_match_by_x(target, candidate):
+    '''
+    remove the impossible combinations by sort the connected areas by their X position due to the stable position relationship before and after breakup
+    '''
+    target_x = sorted(target, key=lambda x: x[2])
+    candidate_x = sorted(candidate, key=lambda x: x[2])
+    clusters = get_partitions(candidate_x, len(target_x))
+    par_byx, child_byx, _ = cal_match_process(target_x, clusters, len(target_x))
+    return par_byx, child_byx
+
+
+def choose_area(txtpath):
+    '''
+    read the ligament trajectory txt
+    '''
+    bp_frame = []
+    infor = {}
+    first_data = {}
+    with open(txtpath, "r") as f:
+        lines = f.readlines()
+    for i in range(len(lines)):
+        line = lines[i].strip().split(" ")
+        if len(line) == 2:
+            next_line = lines[i + 1].strip().split(" ")
+            if next_line[0] != "1":
+
+                frame_id = int(next_line[0])
+                if frame_id not in bp_frame:
+                    bp_frame.append(frame_id)
+
+        if len(line) == 5:
+            frame_id = int(line[0])
+            label_id = int(line[1])
+            if frame_id not in infor.keys():
+
+                infor[frame_id] = [
+                    [
+                        # int(line[0]),
+                        int(line[1]),
+                        int(line[2]),
+                        int(line[3]),
+                        int(line[4]),
+                    ]
+                ]
+            else:
+
+                infor[frame_id].append(
+                    [
+                        # int(line[0]),
+                        int(line[1]),
+                        int(line[2]),
+                        int(line[3]),
+                        int(line[4]),
+                    ]
+                )
+
+    return bp_frame, infor
